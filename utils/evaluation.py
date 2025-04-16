@@ -312,6 +312,9 @@ def calculate_ap(pred_boxes, pred_scores, pred_labels, gt_boxes, gt_labels, iou_
 
 
 def evaluate_detection_streaming(model, dataloader, device, num_classes=8, iou_threshold=0.5, amp=True):
+    """
+    Evaluate detection performance with memory-efficient streaming evaluation and mixed precision
+    """
     model.eval()
     ap_sums = defaultdict(float)
     ap_counts = defaultdict(int)
@@ -320,6 +323,7 @@ def evaluate_detection_streaming(model, dataloader, device, num_classes=8, iou_t
         for images, prior_images, targets in tqdm(dataloader, desc="Evaluating"):
             images = [img.to(device, non_blocking=True) for img in images]
 
+            # Use mixed precision for inference
             with torch.cuda.amp.autocast(enabled=amp):
                 preds = model(torch.stack(images), None, None)
 
@@ -330,13 +334,30 @@ def evaluate_detection_streaming(model, dataloader, device, num_classes=8, iou_t
                 gt_boxes = target['boxes'].detach()
                 gt_labels = target['labels'].detach()
 
-                for c in range(0, num_classes):
+                # Calculate AP per class
+                for c in range(1, num_classes):  # Skip background class (0)
                     if not ((pred_labels == c).any() or (gt_labels == c).any()):
                         continue
 
                     mask_pred = pred_labels == c
                     mask_gt = gt_labels == c
-
+                    
+                    # Skip if no predictions or ground truth for this class
+                    if not mask_pred.any() and not mask_gt.any():
+                        continue
+                    
+                    # Skip empty ground truth
+                    if not mask_gt.any():
+                        ap_sums[c] += 0.0
+                        ap_counts[c] += 1
+                        continue
+                    
+                    # Handle empty predictions separately
+                    if not mask_pred.any():
+                        ap_sums[c] += 0.0
+                        ap_counts[c] += 1
+                        continue
+                    
                     ap = calculate_ap(
                         pred_boxes[mask_pred],
                         pred_scores[mask_pred],
@@ -351,12 +372,12 @@ def evaluate_detection_streaming(model, dataloader, device, num_classes=8, iou_t
                 # Manually release per-sample GPU memory
                 del pred_boxes, pred_labels, pred_scores, gt_boxes, gt_labels
                 torch.cuda.empty_cache()
-                gc.collect()
 
             del preds, images
             torch.cuda.empty_cache()
             gc.collect()
 
+    # Calculate final AP per class and mAP
     final_ap = {c: ap_sums[c] / ap_counts[c] if ap_counts[c] > 0 else 0.0 for c in range(1, num_classes)}
     mAP = np.mean(list(final_ap.values())) if final_ap else 0.0
     return {'mAP': mAP, 'AP_per_class': final_ap}

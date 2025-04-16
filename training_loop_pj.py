@@ -9,6 +9,8 @@ import os
 import time
 import math  # Added for isfinite check
 from datetime import datetime
+from torch.cuda.amp import GradScaler, autocast  # Add these imports for mixed precision
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts  # Add cosine scheduler
 
 from models.detection_network import DomainAdaptiveFasterRCNN
 from utils.data.cityscapes_clean_dataset import Cityscapes_Clean_Dataset, cityscapes_clean_dataset_collate_fn
@@ -33,6 +35,54 @@ wandb.init(
     }
 )
 
+# Custom scheduler that combines linear warmup with cosine annealing with warm restarts
+class LinearWarmupCosineAnnealingScheduler:
+    """Custom scheduler that combines linear warmup with cosine annealing with warm restarts"""
+    def __init__(self, optimizer, warmup_epochs, T_0, T_mult=1, eta_min=0, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.T_0 = T_0
+        self.T_mult = T_mult
+        self.eta_min = eta_min
+        self.last_epoch = last_epoch
+        self.optimizer = optimizer
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        self.step(0)  # Initialize
+        
+    def get_lr(self, epoch):
+        if epoch < self.warmup_epochs:
+            # Linear warmup
+            return [lr * (epoch + 1) / self.warmup_epochs for lr in self.base_lrs]
+        else:
+            # Cosine annealing with warm restarts
+            actual_epoch = epoch - self.warmup_epochs
+            if self.T_mult == 1:
+                cycle = actual_epoch // self.T_0
+                cycle_epoch = actual_epoch % self.T_0
+                cos_factor = 0.5 * (1 + np.cos(np.pi * cycle_epoch / self.T_0))
+            else:
+                n = 0
+                cycle_epoch = actual_epoch
+                while cycle_epoch >= self.T_0 * (self.T_mult ** n):
+                    cycle_epoch -= self.T_0 * (self.T_mult ** n)
+                    n += 1
+                cycle = n
+                cos_factor = 0.5 * (1 + np.cos(np.pi * cycle_epoch / (self.T_0 * (self.T_mult ** (cycle)))))
+            
+            return [self.eta_min + (lr - self.eta_min) * cos_factor for lr in self.base_lrs]
+    
+    def step(self, epoch=None):
+        if epoch is None:
+            self.last_epoch += 1
+            values = self.get_lr(self.last_epoch)
+        else:
+            self.last_epoch = epoch
+            values = self.get_lr(epoch)
+            
+        for param_group, lr in zip(self.optimizer.param_groups, values):
+            param_group['lr'] = lr
+        
+        return values
+
 # Initialize model
 model = DomainAdaptiveFasterRCNN(num_classes=8, backbone_name='vgg16', verbose=False)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,8 +91,18 @@ model.to(device)
 # Log model architecture to wandb
 wandb.watch(model, log="all", log_freq=10)
 
-# Optimizer with a lower learning rate for stability
-optimizer = optim.SGD(model.parameters(), lr=0.0005, momentum=0.9, weight_decay=0.0005)
+# Increase initial learning rate for faster convergence
+initial_lr = 0.003  # Increased further from 0.001 to help break through plateaus
+optimizer = optim.SGD(model.parameters(), lr=initial_lr, momentum=0.9, weight_decay=0.0005)
+
+# Use our custom scheduler with warmup to address plateauing
+scheduler = LinearWarmupCosineAnnealingScheduler(
+    optimizer,
+    warmup_epochs=2,     # First 2 epochs are for warmup
+    T_0=4,               # Restart every 4 epochs after warmup
+    T_mult=2,            # Double the restart period after each restart
+    eta_min=1e-6         # Minimum learning rate
+)
 
 # Dataset paths
 data_root = "/teamspace/studios/this_studio/Prior4WeatherDetection/datataset/cityscapes"
@@ -73,29 +133,39 @@ val_target_dataset = Cityscapes_Foggy_Dataset(
     transform=None
 )
 
-# Dataloaders with smaller batch size for stability
+# Dataloaders with optimized settings for maximum performance
 source_loader = DataLoader(
     source_dataset,
-    batch_size = batch_size,
+    batch_size=batch_size,
     shuffle=True,
     collate_fn=cityscapes_clean_dataset_collate_fn,
-    num_workers=4
+    num_workers=8,  # Increased from 4 to 8 for faster data loading
+    pin_memory=True,  # Enable pin_memory for faster CPU->GPU transfers
+    prefetch_factor=2,  # Prefetch 2 batches ahead
+    persistent_workers=True  # Keep workers alive between batches
 )
 
 target_loader = DataLoader(
     target_dataset,
-    batch_size = batch_size,
+    batch_size=batch_size,
     shuffle=True,
     collate_fn=cityscapes_foggy_dataset_collate_fn,
-    num_workers=4
+    num_workers=8,  # Increased from 4 to 8 for faster data loading
+    pin_memory=True,  # Enable pin_memory for faster CPU->GPU transfers
+    prefetch_factor=2,  # Prefetch 2 batches ahead
+    persistent_workers=True  # Keep workers alive between batches
 )
+
+# Use smaller batch size for validation to avoid OOM issues
+val_batch_size = batch_size // 2
 
 val_source_loader = DataLoader(
     val_source_dataset,
-    batch_size = batch_size,
+    batch_size=val_batch_size,
     shuffle=False,
     collate_fn=cityscapes_clean_dataset_collate_fn,
-    num_workers=4
+    num_workers=4,  # Use fewer workers for validation
+    pin_memory=True
 )
 
 val_target_loader = DataLoader(
@@ -140,204 +210,12 @@ def is_valid_loss(loss_value):
 
 # Training loop with validation and stability improvements
 def train(model, source_loader, target_loader, val_source_loader, val_target_loader, optimizer, device, config):
-    # skipped_batches = 0
-    # total_batches = 0
-    
-    # for epoch in range(config["num_epochs"]):
-    #     # Training phase
-    #     model.train()
-    #     source_epoch_loss = 0.0
-    #     target_epoch_loss = 0.0
-    #     classifier_loss = 0.0
-    #     box_reg_loss = 0.0
-    #     objectness_loss = 0.0
-    #     rpn_box_reg_loss = 0.0
-    #     pal_loss = 0.0
-    #     reg_loss = 0.0
-        
-    #     num_batches = 0
-    #     epoch_skipped_batches = 0
-    #     start_time = time.time()
-        
-    #     # Create iterator for target_loader to handle different dataset sizes
-    #     target_iter = iter(target_loader)
-        
-    #     source_tqdm = tqdm(source_loader, desc=f"Epoch {epoch+1}/{config['num_epochs']} [Train Source]")
-        
-    #     for batch_idx, source_batch in enumerate(source_tqdm):
-    #         total_batches += 1
-            
-    #         try:
-    #             # Get a batch from target dataset
-    #             try:
-    #                 target_batch = next(target_iter)
-    #             except StopIteration:
-    #                 target_iter = iter(target_loader)
-    #                 target_batch = next(target_iter)
-                
-    #             # Source domain training
-    #             source_images, source_prior_images, source_targets = source_batch
-    #             source_images = [img.to(device) for img in source_images]
-    #             source_prior_images = [img.to(device) for img in source_prior_images]
-    #             source_targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in source_targets]
-
-    #             source_images_tensor = torch.stack(source_images)
-    #             source_prior_images_tensor = torch.stack(source_prior_images)
-
-    #             # Forward pass for source domain
-    #             source_losses = model(source_images_tensor, source_prior_images_tensor, source_targets)
-                
-    #             # Check for valid losses and replace NaN/Inf values
-    #             for k in list(source_losses.keys()):
-    #                 if not is_valid_loss(source_losses[k]):
-    #                     print(f"Warning: Invalid {k} in source batch {batch_idx}: {source_losses[k]}")
-    #                     source_losses[k] = torch.tensor(0.0, device=device, requires_grad=True)
-                
-    #             # Sum all source losses with upper bound to prevent explosion
-    #             source_loss_values = [v.item() if is_valid_loss(v) else 0.0 for v in source_losses.values()]
-    #             if any(l > 100.0 for l in source_loss_values):
-    #                 print(f"Warning: Large loss values in source batch {batch_idx}: {source_loss_values}")
-                
-    #             source_loss = sum(source_losses.values())
-                
-    #             if not is_valid_loss(source_loss):
-    #                 raise ValueError(f"Invalid combined source loss: {source_loss}")
-                
-    #             # Track individual losses (safely)
-    #             classifier_loss += source_losses.get('loss_classifier', torch.tensor(0.0)).item()
-    #             box_reg_loss += source_losses.get('loss_box_reg', torch.tensor(0.0)).item()
-    #             objectness_loss += source_losses.get('loss_objectness', torch.tensor(0.0)).item()
-    #             rpn_box_reg_loss += source_losses.get('loss_rpn_box_reg', torch.tensor(0.0)).item()
-    #             pal_loss += source_losses.get('loss_pal', torch.tensor(0.0)).item()
-
-    #             # Backward pass and optimization with gradient clipping
-    #             optimizer.zero_grad()
-    #             source_loss.backward()
-    #             # Apply gradient clipping to prevent exploding gradients
-    #             utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
-    #             optimizer.step()
-                
-    #             source_epoch_loss += source_loss.item()
-                
-    #             # Target domain training
-    #             target_images, target_prior_images, target_targets = target_batch
-    #             target_images = [img.to(device) for img in target_images]
-    #             target_prior_images = [img.to(device) for img in target_prior_images]
-    #             target_targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in target_targets]
-
-    #             target_images_tensor = torch.stack(target_images)
-    #             target_prior_images_tensor = torch.stack(target_prior_images)
-
-    #             # Forward pass for target domain
-    #             target_losses = model(target_images_tensor, target_prior_images_tensor, target_targets)
-                
-    #             # Check for valid losses and replace NaN/Inf values
-    #             for k in list(target_losses.keys()):
-    #                 if not is_valid_loss(target_losses[k]):
-    #                     print(f"Warning: Invalid {k} in target batch {batch_idx}: {target_losses[k]}")
-    #                     target_losses[k] = torch.tensor(0.0, device=device, requires_grad=True)
-                
-    #             # Sum all target losses with validation
-    #             target_loss = sum(target_losses.values())
-                
-    #             if not is_valid_loss(target_loss):
-    #                 raise ValueError(f"Invalid combined target loss: {target_loss}")
-                
-    #             # Track individual target losses (safely)
-    #             pal_loss += target_losses.get('loss_pal', torch.tensor(0.0)).item()
-    #             reg_loss += target_losses.get('loss_reg', torch.tensor(0.0)).item()
-
-    #             # Backward pass and optimization with gradient clipping
-    #             optimizer.zero_grad()
-    #             target_loss.backward()
-    #             utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
-    #             optimizer.step()
-                
-    #             target_epoch_loss += target_loss.item()
-    #             num_batches += 1
-                
-    #             # Log per-batch losses to wandb for more granular visualization
-    #             global_step = epoch * len(source_loader) + batch_idx
-    #             wandb.log({
-    #                 "batch/source_loss": source_loss.item(),
-    #                 "batch/target_loss": target_loss.item(),
-    #                 "batch/classifier_loss": source_losses.get('loss_classifier', torch.tensor(0.0)).item(),
-    #                 "batch/box_reg_loss": source_losses.get('loss_box_reg', torch.tensor(0.0)).item(),
-    #                 "batch/objectness_loss": source_losses.get('loss_objectness', torch.tensor(0.0)).item(),
-    #                 "batch/rpn_box_reg_loss": source_losses.get('loss_rpn_box_reg', torch.tensor(0.0)).item(),
-    #                 "batch/pal_loss": (source_losses.get('loss_pal', torch.tensor(0.0)).item() + 
-    #                                  target_losses.get('loss_pal', torch.tensor(0.0)).item()) / 2,
-    #                 "batch/reg_loss": target_losses.get('loss_reg', torch.tensor(0.0)).item(),
-    #                 "global_step": global_step
-    #             })
-                
-    #             # Update tqdm description with latest losses
-    #             source_tqdm.set_postfix({
-    #                 'source_loss': f"{source_loss.item():.4f}", 
-    #                 'target_loss': f"{target_loss.item():.4f}",
-    #                 'skipped': epoch_skipped_batches
-    #             })
-                
-    #         except Exception as e:
-    #             epoch_skipped_batches += 1
-    #             skipped_batches += 1
-    #             print(f"Error in batch {batch_idx}: {str(e)}")
-    #             print(f"Skipping this batch and continuing training...")
-    #             continue
-        
-    #     # Calculate average losses (safely)
-    #     if num_batches > 0:
-    #         avg_source_loss = source_epoch_loss / num_batches
-    #         avg_target_loss = target_epoch_loss / num_batches
-    #         avg_classifier_loss = classifier_loss / num_batches
-    #         avg_box_reg_loss = box_reg_loss / num_batches
-    #         avg_objectness_loss = objectness_loss / num_batches
-    #         avg_rpn_box_reg_loss = rpn_box_reg_loss / num_batches
-    #         avg_pal_loss = pal_loss / (num_batches * 2)  # Both source and target contribute
-    #         avg_reg_loss = reg_loss / num_batches
-    #     else:
-    #         print("Warning: No valid batches in epoch. Using zeros for metrics.")
-    #         avg_source_loss = avg_target_loss = avg_classifier_loss = avg_box_reg_loss = 0.0
-    #         avg_objectness_loss = avg_rpn_box_reg_loss = avg_pal_loss = avg_reg_loss = 0.0
-        
-    #     # Clear GPU cache to free up memory
-    #     if torch.cuda.is_available():
-    #         torch.cuda.empty_cache()
-    #         # Optional: print memory stats for debugging
-    #         allocated = torch.cuda.memory_allocated() / (1024 * 1024)
-    #         reserved = torch.cuda.memory_reserved() / (1024 * 1024)
-    #         print(f"  GPU Memory: {allocated:.2f}MB allocated, {reserved:.2f}MB reserved")
-
-    #     # Perform garbage collection to help free memory
-    #     gc.collect()
-
-        
-    #     epoch_time = time.time() - start_time
-    #     skip_rate = epoch_skipped_batches / (num_batches + epoch_skipped_batches) if (num_batches + epoch_skipped_batches) > 0 else 0
-        
-    #     print(f"Epoch [{epoch+1}/{config['num_epochs']}] Time: {epoch_time:.2f}s, Skip rate: {skip_rate:.2%}")
-    #     print(f"  Source Loss: {avg_source_loss:.4f}, Target Loss: {avg_target_loss:.4f}")
-        
-    #     # Log to wandb (safely ensuring all values are finite)
-    #     wandb.log({
-    #         "epoch": epoch + 1,
-    #         "train/source_loss": avg_source_loss if is_valid_loss(avg_source_loss) else 0.0,
-    #         "train/target_loss": avg_target_loss if is_valid_loss(avg_target_loss) else 0.0,
-    #         "train/classifier_loss": avg_classifier_loss if is_valid_loss(avg_classifier_loss) else 0.0,
-    #         "train/box_reg_loss": avg_box_reg_loss if is_valid_loss(avg_box_reg_loss) else 0.0,
-    #         "train/objectness_loss": avg_objectness_loss if is_valid_loss(avg_objectness_loss) else 0.0,
-    #         "train/rpn_box_reg_loss": avg_rpn_box_reg_loss if is_valid_loss(avg_rpn_box_reg_loss) else 0.0,
-    #         "train/pal_loss": avg_pal_loss if is_valid_loss(avg_pal_loss) else 0.0,
-    #         "train/reg_loss": avg_reg_loss if is_valid_loss(avg_reg_loss) else 0.0,
-    #         "train/epoch_time": epoch_time,
-    #         "train/skip_rate": skip_rate,
-    #         "lr": optimizer.param_groups[0]['lr']
-    #     })
-
-
     skipped_batches = 0
     total_batches = 0
     lambda_reg = config.get("lambda_reg", 1.0)  # Regularization weight
+    
+    # Add scaler for mixed precision training
+    scaler = GradScaler()
     
     for epoch in range(config["num_epochs"]):
         # Training phase
@@ -377,8 +255,9 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                 source_images_tensor = torch.stack(source_images)
                 source_prior_images_tensor = torch.stack(source_prior_images)
 
-                # Forward pass for source domain
-                source_losses = model(source_images_tensor, source_prior_images_tensor, source_targets)
+                # Forward pass for source domain with mixed precision
+                with autocast():
+                    source_losses = model(source_images_tensor, source_prior_images_tensor, source_targets)
                 
                 # Check for valid losses and replace NaN/Inf values
                 for k in list(source_losses.keys()):
@@ -395,8 +274,9 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                 target_images_tensor = torch.stack(target_images)
                 target_prior_images_tensor = torch.stack(target_prior_images)
 
-                # Forward pass for target domain
-                target_losses = model(target_images_tensor, target_prior_images_tensor, target_targets)
+                # Forward pass for target domain with mixed precision
+                with autocast():
+                    target_losses = model(target_images_tensor, target_prior_images_tensor, target_targets)
                 
                 # Check for valid losses and replace NaN/Inf values
                 for k in list(target_losses.keys()):
@@ -428,10 +308,12 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                 
                 # Backward pass and optimization with gradient clipping
                 optimizer.zero_grad()
-                combined_loss.backward()
+                scaler.scale(combined_loss).backward()
                 # Apply gradient clipping to prevent exploding gradients
+                scaler.unscale_(optimizer)
                 utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 # Track losses for logging
                 combined_epoch_loss += combined_loss.item()
@@ -451,12 +333,14 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                     "batch/reg_loss": l_reg.item(),
                     "batch/pal_src_loss": l_pal_src.item(),
                     "batch/pal_tgt_loss": l_pal_tgt.item(),
-                    "global_step": global_step
+                    "global_step": global_step,
+                    "lr": optimizer.param_groups[0]['lr']  # Log current learning rate
                 })
                 
                 # Update tqdm description
                 source_tqdm.set_postfix({
                     'loss': f"{combined_loss.item():.4f}",
+                    'lr': f"{optimizer.param_groups[0]['lr']:.6f}",
                     'skipped': epoch_skipped_batches
                 })
                 
@@ -466,6 +350,9 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                 print(f"Error in batch {batch_idx}: {str(e)}")
                 print(f"Skipping this batch and continuing training...")
                 continue
+        
+        # Step the learning rate scheduler after each epoch
+        scheduler.step()
         
         # Calculate average losses
         if num_batches > 0:
@@ -511,46 +398,6 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
             "train/skip_rate": skip_rate,
             "lr": optimizer.param_groups[0]['lr']
         })
-        
-        # # Validation phase
-        # if (epoch + 1) % config["eval_interval"] == 0:
-        #     print("Running validation...")
-        #     try:
-        #         # Evaluate on source validation set
-        #         source_metrics = evaluate_detection(
-        #             model, val_source_loader, device, num_classes=8
-        #         )
-        #         # Evaluate on target validation set
-        #         target_metrics = evaluate_detection(
-        #             model, val_target_loader, device, num_classes=8
-        #         )
-
-        #         print('calculated target metrics')
-        #         source_mAP = source_metrics['mAP']
-        #         target_mAP = target_metrics['mAP']
-                
-        #         print(f"  Validation: Source mAP: {source_mAP:.4f}, Target mAP: {target_mAP:.4f}")
-                
-        #         # Log per-class AP to wandb
-        #         source_ap_per_class = source_metrics['AP_per_class']
-        #         target_ap_per_class = target_metrics['AP_per_class']
-                
-        #         for class_id, ap in source_ap_per_class.items():
-        #             wandb.log({f"val_source/AP_class_{class_id}": ap, "epoch": epoch + 1})
-                
-        #         for class_id, ap in target_ap_per_class.items():
-        #             wandb.log({f"val_target/AP_class_{class_id}": ap, "epoch": epoch + 1})
-                
-        #         # Log overall metrics
-        #         wandb.log({
-        #             "val_source/mAP": source_mAP,
-        #             "val_target/mAP": target_mAP,
-        #             "epoch": epoch + 1
-        #         })
-        #     except Exception as e:
-        #         print(f"Error during validation: {e}")
-        #         print("Skipping this validation step and continuing training...")
-
 
         # Validation phase
         if (epoch + 1) % config["eval_interval"] == 0:
@@ -592,14 +439,6 @@ def train(model, source_loader, target_loader, val_source_loader, val_target_loa
                 print(f"Error during validation: {e}")
                 print("Skipping this validation step and continuing training...")
         
-        # # Save checkpoint
-        # if (epoch + 1) % config["save_interval"] == 0:
-        #     try:
-        #         save_checkpoint(epoch + 1, model, optimizer, avg_source_loss + avg_target_loss)
-        #         # Also save model to wandb
-        #         wandb.save(os.path.join(config["checkpoint_dir"], f"model_epoch_{epoch+1}.pth"))
-        #     except Exception as e:
-        #         print(f"Error saving checkpoint: {e}")
         # Save checkpoint
         if (epoch + 1) % config["save_interval"] == 0:
             try:
