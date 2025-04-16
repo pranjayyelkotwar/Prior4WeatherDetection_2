@@ -40,3 +40,5 @@ echo "🧹 Cleaning up zip files..."
 rm -f *.zip
 
 echo "🎉 All done! Data is in dataset/cityscapes/"
+
+# then follow instructinos given here https://tillbeemelmanns.github.io/2020/10/10/convert-cityscapes-to-coco-dataset-format.html
