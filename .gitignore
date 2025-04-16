@@ -1,0 +1,16 @@
+datataset/cityscapes/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+.env
+.venv
+venv/
+ENV/
+*.log
+.idea/
+.vscode/
+checkpoints/
+checkpoints
+wandb
+checkpoints
