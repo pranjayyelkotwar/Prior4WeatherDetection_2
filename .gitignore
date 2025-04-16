@@ -14,3 +14,5 @@ checkpoints/
 checkpoints
 wandb
 checkpoints
+cookies.txt
+gtFine_trainvaltest.zip leftImg8bit_trainvaltest.zip leftImg8bit_trainvaltest_foggy.zip
