@@ -8,7 +8,7 @@ mkdir -p dataset/cityscapes
 # Step 1: Login and save cookies
 echo "🔐 Logging in to Cityscapes..."
 wget --keep-session-cookies --save-cookies=cookies.txt \
-     --post-data 'username=PranjayYelkotwar&password=DL@Assignment123&submit=Login' \
+     --post-data 'username={user_name}&password={password}&submit=Login' \
      https://www.cityscapes-dataset.com/login/ -O /dev/null
 
 # Step 2: Download URLs
